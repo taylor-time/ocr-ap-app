@@ -143,6 +143,10 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
         finally:
             db.close()
 
+    except AzureOCRError as e:
+        logger.error(f"OCR processing failed: {e}")
+        raise HTTPException(status_code=500, detail=f"OCR processing failed: {str(e)}")
+
         return JSONResponse(
             status_code=200,
             content={
