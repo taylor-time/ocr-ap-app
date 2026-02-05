@@ -188,14 +188,6 @@ async def get_recent_invoices(limit: int = 100):
     finally:
         db.close()
 
-    except AzureOCRError as e:
-        logger.error(f"Azure OCR error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    except Exception as e:
-        logger.error("Unexpected error", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error") from e
-
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
