@@ -1,18 +1,6 @@
-# Ensure setuptools and wheel are installed first
-setuptools>=65.0.0
-wheel>=0.38.0
-
-# Azure Form Recognizer / Document Intelligence (stable v3.x)
-azure-ai-formrecognizer==3.3.3
-
-# FastAPI and server
-fastapi==0.109.0
-uvicorn[standard]==0.27.0
-python-multipart==0.0.6
-
-# Utilities
-python-dotenv==1.0.0
-pydantic==2.5.3
-
-# Additional dependencies that might be needed
-typing-extensions>=4.5.0
+azure-ai-formrecognizer
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+pydantic
