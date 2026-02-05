@@ -1,7 +1,6 @@
 # file: main.py
 """
-FastAPI backend for crew management application with Azure OCR invoice processing.
-"""
+FastAPI backend for retail/grocery invoice management with Azure OCR processing and price change tracking."""
 
 import os
 import logging
@@ -15,6 +14,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from azure_ocr import analyze_invoice_from_bytes, AzureOCRError
+import json
+from datetime import datetime
+from sqlalchemy.orm import Session
+from database import engine, get_db
+from models import Invoice
+from init_db import init_database
 
 # --- Load .env explicitly from this project folder (Windows-safe) ---
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -29,8 +34,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Crew Management API",
-    description="Backend API for crew management with invoice OCR processing",
+    titleRetail Invoice Management API
+    description="Backend API forretail/grocery invoice processing with OCR and price change tracking
     version="1.0.0",
 )
 
@@ -42,12 +47,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database on startup"""
+    try:
+        init_database()
+        logger.info("Database initialized successfully")
+    except Exception as e:
+        logger.error(f"Database initialization failed: {e}")
+
 
 @app.get("/")
 async def root():
     return {
         "status": "healthy",
-        "message": "Crew Management API is running",
+        "message": "Retail Invoice Management API is running
         "endpoints": {"health": "/health", "upload_invoice": "/upload-invoice-pdf"},
     }
 
@@ -102,6 +116,32 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
 
         # Remove raw SDK result from response (not JSON serializable)
         result.pop("raw", None)
+        
+        # Save to database
+        db = next(get_db())
+        try:
+            invoice = Invoice(
+                source="ocr",
+                filename=file.filename,
+                status="success",
+                vendor_name=result.get("vendor_name"),
+                invoice_date=result.get("invoice_date"),
+                invoice_number=result.get("invoice_id"),
+                total_amount=result.get("total"),
+                subtotal=result.get("subtotal"),
+                tax=result.get("total_tax"),
+                items_json=json.dumps(result.get("items", [])),
+                raw_ocr_data=json.dumps(result)
+            )
+            db.add(invoice)
+            db.commit()
+            db.refresh(invoice)
+            logger.info(f"Invoice saved to database with ID: {invoice.id}")
+        except Exception as db_error:
+            logger.error(f"Database save failed: {db_error}")
+            db.rollback()
+        finally:
+            db.close()
 
         return JSONResponse(
             status_code=200,
@@ -112,6 +152,41 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
                 "filename": file.filename,
             },
         )
+
+@app.get("/recent-invoices")
+async def get_recent_invoices(limit: int = 100):
+    """Fetch recent invoice uploads from database"""
+    db = next(get_db())
+    try:
+        invoices = db.query(Invoice).order_by(Invoice.created_at.desc()).limit(limit).all()
+        
+        result = []
+        for inv in invoices:
+            result.append({
+                "id": inv.id,
+                "created_at": inv.created_at.isoformat() if inv.created_at else None,
+                "status": inv.status,
+                "error_message": inv.error_message,
+                "source": inv.source,
+                "filename": inv.filename,
+                "vendor_name": inv.vendor_name,
+                "invoice_date": inv.invoice_date,
+                "invoice_number": inv.invoice_number,
+                "total_amount": inv.total_amount,
+                "subtotal": inv.subtotal,
+                "tax": inv.tax,
+                "items": json.loads(inv.items_json) if inv.items_json else [],
+            })
+        
+        return JSONResponse(
+            status_code=200,
+            content={"success": True, "count": len(result), "invoices": result}
+        )
+    except Exception as e:
+        logger.error(f"Failed to fetch invoices: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch invoices")
+    finally:
+        db.close()
 
     except AzureOCRError as e:
         logger.error(f"Azure OCR error: {e}")
