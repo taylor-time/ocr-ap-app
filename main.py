@@ -61,7 +61,7 @@ async def startup_event():
 async def root():
     return {
         "status": "healthy",
-        "message": "Retail Invoice Management API is running
+        "message": "Retail Invoice Management API is running",
         "endpoints": {"health": "/health", "upload_invoice": "/upload-invoice-pdf"},
     }
 
