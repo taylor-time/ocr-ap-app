@@ -34,7 +34,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title"Ret"ail Invoice Management API",
+    title="Retail Invoice Management API",
     description="Backend API for retail/grocery invoice processing with OCR and price change tracking",
     version="1.0.0",
 )
