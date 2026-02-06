@@ -130,7 +130,8 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
         result.pop("raw", None)
         
         # Save to database
-        db = next(get_db())
+        db_gen = get_db()
+        db = next(db_gen)
         try:
             invoice = Invoice(
                 source="ocr",
@@ -149,22 +150,22 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
             db.commit()
             db.refresh(invoice)
             logger.info(f"Invoice saved to database with ID: {invoice.id}")
-            
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "success": True,
-                    "data": result,
-                    "item_count": len(result.get("items", [])),
-                    "filename": file.filename,
-                },
-            )
         except Exception as db_error:
             logger.error(f"Database save failed: {db_error}")
             db.rollback()
             raise HTTPException(status_code=500, detail=f"Database error: {str(db_error)}")
         finally:
             db.close()
+        
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "data": result,
+                "item_count": len(result.get("items", [])),
+                "filename": file.filename,
+            },
+        )
 
     except AzureOCRError as e:
         logger.error(f"OCR processing failed: {e}")
