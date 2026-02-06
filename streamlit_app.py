@@ -22,7 +22,7 @@ authenticator = stauth.Authenticate(
     st.secrets["credentials"]["cookie_name"],
     st.secrets["credentials"]["cookie_key"],
     st.secrets["credentials"]["cookie_expiry_days"]
-))
+)
 
 # Login widget
 name, authentication_status, username = authenticator.login('Login', 'main')
