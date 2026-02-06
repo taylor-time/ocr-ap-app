@@ -141,7 +141,7 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
                 invoice_number=result.get("invoice_id"),
                 total_amount=result.get("total"),
                 subtotal=result.get("subtotal"),
-                tax=result.get("total_tax"),
+                # Tax will be entered during pre-coding
                 items_json=json.dumps(result.get("items", [])),
                 raw_ocr_data=json.dumps(result)
             )
