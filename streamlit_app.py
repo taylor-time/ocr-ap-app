@@ -30,7 +30,7 @@ credentials = {
 }
 
 authenticator = stauth.Authenticate(
-    credentials["usernames"],
+    credentials,
     "invoice_ocr_cookie",
     "crew_invoice_ocr_key_12345",
     30
