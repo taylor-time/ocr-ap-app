@@ -18,7 +18,7 @@ st.set_page_config(
 # Authentication
 # Create authenticator with credentials from secrets
 authenticator = stauth.Authenticate(
-        dict(st.secrets["credentials"]["usernames"]),
+            {k: dict(v) for k, v in st.secrets["credentials"]["usernames"].items()},
     st.secrets["credentials"]["cookie_name"],
     st.secrets["credentials"]["cookie_key"],
     st.secrets["credentials"]["cookie_expiry_days"]
