@@ -34,8 +34,8 @@ elif authentication_status == None:
     st.warning('Please enter your username and password')
     st.stop()
     else:
+            # User is authenticated - show logout button
 
-    # User is authenticated - show logout button
     authenticator.logout('Logout', 'sidebar')
     st.sidebar.write(f'Welcome *{name}*')
     
