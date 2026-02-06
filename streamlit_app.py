@@ -15,13 +15,26 @@ st.set_page_config(
     layout="wide"
 )
 
-# Authentication
-# Create authenticator with credentials from secrets
+# Authentication - simplified approach
+credentials = {
+    "usernames": {
+        "ktaylor": {
+            "name": "Kevin Taylor",
+            "password": "$2b$12$ExZaYVK1fsbw1ZfbX30XePaWxn96p36WQoeG6Lruj3vjP6ga311W"  # admin123
+        },
+        "mhermani": {
+            "name": "Matteo Hermani", 
+            "password": "$2b$12$nBzKp3lV9L1GvH8YxR2fPujZ3BUiVTfNm9mKp4pGa6WnXqLm5Hf2"  # horses123
+        }
+    }
+}
+
 authenticator = stauth.Authenticate(
-            {k: dict(v) for k, v in st.secrets["credentials"]["usernames"].items()},
-    st.secrets["credentials"]["cookie_name"],
-    st.secrets["credentials"]["cookie_key"],
-    st.secrets["credentials"]["cookie_expiry_days"]
+    credentials["usernames"],
+    "invoice_ocr_cookie",
+    "crew_invoice_ocr_key_12345",
+    30
+)
 )
 
 # Login widget
