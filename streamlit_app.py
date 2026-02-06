@@ -6,8 +6,7 @@ import streamlit as st
 import requests
 import pandas as pd
 from datetime import datetime
-import streamlit_authenticator as stauth
-
+import bcrypt
 # Configure the page
 st.set_page_config(
     page_title="Invoice OCR - Crew Management",
@@ -29,26 +28,50 @@ credentials = {
     }
 }
 
-authenticator = stauth.Authenticate(
-    credentials,
-    "invoice_ocr_cookie",
-    "crew_invoice_ocr_key_12345",
-        auto_hash=False
-    )
+# Initialize session state
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+if 'username' not in st.session_state:
+    st.session_state.username = None
+if 'name' not in st.session_state:
+    st.session_state.name = None
 
-# Login widget
-name, authentication_status, username = authenticator.login('Login', 'main')
+# Authentication function
+def check_password(username, password):
+    if username in credentials["usernames"]:
+        user_data = credentials["usernames"][username]
+        hashed_pw = user_data["password"].encode('utf-8')
+        return bcrypt.checkpw(password.encode('utf-8'), hashed_pw)
+    return False
 
-if authentication_status == False:
-    st.error('Username/password is incorrect')
+# Login form
+if not st.session_state.authenticated:
+    st.title("🔐 Login")
+    
+    with st.form("login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submit = st.form_submit_button("Login")
+        
+        if submit:
+            if check_password(username, password):
+                st.session_state.authenticated = True
+                st.session_state.username = username
+                st.session_state.name = credentials["usernames"][username]["name"]
+                st.rerun()
+            else:
+                st.error("Username/password is incorrect")
     st.stop()
-elif authentication_status == None:
-    st.warning('Please enter your username and password')
-    st.stop()
-else:
-    # User is authenticated - show logout button
-    authenticator.logout('Logout', 'sidebar')
-    st.sidebar.write(f'Welcome *{name}*')
+
+# Show logout button in sidebar
+with st.sidebar:
+    st.write(f"Welcome **{st.session_state.name}**")
+    if st.button("Logout"):
+        st.session_state.authenticated = False
+        st.session_state.username = None
+        st.session_state.name = None
+        st.rerun()
+
     
     # API Configuration
     API_URL = "https://ocr-ap-app.onrender.com"
