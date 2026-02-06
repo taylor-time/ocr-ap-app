@@ -1,18 +1,12 @@
 from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Boolean
-from datetime import datetime, timezone
+from datetime import datetime
 from database import Base
-
-
-def utcnow():
-    """UTC timestamp helper (avoids deprecated datetime.utcnow)"""
-    return datetime.now(timezone.utc)
-
 
 class Invoice(Base):
     __tablename__ = "invoices"
     
     id = Column(Integer, primary_key=True, index=True)
-    created_at = Column(DateTime, default=utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
     
     # Processing status
     status = Column(String, default="success")  # success, failed, manual
@@ -68,5 +62,5 @@ class Invoice(Base):
     dept_status = Column(String, default="pending")  # approved, pending, rejected
     
     # Audit trail
-    last_updated = Column(DateTime, default=utcnow, onupdate=utcnow)
+    last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     last_updated_by = Column(String, nullable=True)

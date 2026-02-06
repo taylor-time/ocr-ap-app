@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 from azure_ocr import analyze_invoice_from_bytes, AzureOCRError
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 from sqlalchemy.orm import Session
 from database import engine, SessionLocal
 from models import Invoice
@@ -78,6 +78,30 @@ class DeptRejectRequest(BaseModel):
 def get_db_session() -> Session:
     """Create a new database session (caller must close it)."""
     return SessionLocal()
+
+
+def clean_price(value) -> Optional[float]:
+    """Convert OCR price strings like '$1,533.48' to float.
+    Returns None if the value cannot be parsed."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        # Remove $, commas, spaces, and other currency symbols
+        cleaned = value.strip().replace("$", "").replace(",", "").replace(" ", "")
+        # Remove other common currency prefixes/suffixes
+        for sym in ["CAD", "USD", "EUR", "GBP", "£", "€"]:
+            cleaned = cleaned.replace(sym, "")
+        cleaned = cleaned.strip()
+        if not cleaned:
+            return None
+        try:
+            return float(cleaned)
+        except ValueError:
+            logger.warning(f"Could not parse price value: {value!r}")
+            return None
+    return None
 
 
 app = FastAPI(
@@ -168,6 +192,12 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
         logger.error(f"OCR processing failed: {e}")
         raise HTTPException(status_code=500, detail=f"OCR processing failed: {str(e)}")
 
+    # Clean price values from OCR (they come back as "$1,533.48" strings)
+    total_amount = clean_price(result.get("total"))
+    subtotal = clean_price(result.get("subtotal"))
+
+    logger.info(f"Cleaned prices - total: {result.get('total')!r} -> {total_amount}, subtotal: {result.get('subtotal')!r} -> {subtotal}")
+
     # Save to database (separate from OCR try/except)
     db = get_db_session()
     try:
@@ -178,8 +208,8 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
             vendor_name=result.get("vendor_name"),
             invoice_date=result.get("invoice_date"),
             invoice_number=result.get("invoice_id"),
-            total_amount=result.get("total"),
-            subtotal=result.get("subtotal"),
+            total_amount=total_amount,
+            subtotal=subtotal,
             items_json=json.dumps(result.get("items", [])),
             raw_ocr_data=json.dumps(result)
         )
@@ -329,7 +359,7 @@ async def precode_invoice(invoice_id: int, body: PrecodeRequest):
         invoice.po_number = body.po_number
         invoice.receipt_number = body.receipt_number
         invoice.precoder = body.precoder
-        invoice.precoding_date = datetime.now(timezone.utc)
+        invoice.precoding_date = datetime.utcnow()
         invoice.precoding_notes = body.notes
         
         # Update tax fields
@@ -347,10 +377,10 @@ async def precode_invoice(invoice_id: int, body: PrecodeRequest):
         
         # Auto-assign to department manager
         invoice.dept_reviewer = DEPARTMENT_MANAGERS[body.department]
-        invoice.dept_assigned_date = datetime.now(timezone.utc)
+        invoice.dept_assigned_date = datetime.utcnow()
         invoice.dept_status = "pending"
         
-        invoice.last_updated = datetime.now(timezone.utc)
+        invoice.last_updated = datetime.utcnow()
         invoice.last_updated_by = body.precoder
         
         db.commit()
@@ -413,10 +443,10 @@ async def dept_approve_invoice(invoice_id: int, body: DeptApproveRequest):
         
         # Approve
         invoice.dept_status = "approved"
-        invoice.dept_review_date = datetime.now(timezone.utc)
+        invoice.dept_review_date = datetime.utcnow()
         invoice.dept_review_notes = body.notes
         invoice.stage_status = "approved"
-        invoice.last_updated = datetime.now(timezone.utc)
+        invoice.last_updated = datetime.utcnow()
         invoice.last_updated_by = body.reviewer
         
         db.commit()
@@ -453,11 +483,11 @@ async def dept_reject_invoice(invoice_id: int, body: DeptRejectRequest):
         
         # Reject and send back to Stage 2
         invoice.dept_status = "rejected"
-        invoice.dept_review_date = datetime.now(timezone.utc)
+        invoice.dept_review_date = datetime.utcnow()
         invoice.dept_review_notes = body.notes
         invoice.current_stage = 2
         invoice.stage_status = "precoding"
-        invoice.last_updated = datetime.now(timezone.utc)
+        invoice.last_updated = datetime.utcnow()
         invoice.last_updated_by = body.reviewer
         
         db.commit()
