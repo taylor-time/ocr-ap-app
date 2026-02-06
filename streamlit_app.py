@@ -40,7 +40,7 @@ if 'name' not in st.session_state:
 def check_password(username, password):
     if username in credentials["usernames"]:
         user_data = credentials["usernames"][username]
-                hashed_pw = user_data["password"]
+        hashed_pw = user_data["password"]
                 return bcrypt.checkpw(password.encode('utf-8'), hashed_pw.encode('utf-8'))
     return False
 
