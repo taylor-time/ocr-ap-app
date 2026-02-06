@@ -16,13 +16,13 @@ st.set_page_config(
 )
 
 # Authentication
-config = dict(st.secrets["credentials"])
+# Create authenticator with credentials from secrets
 authenticator = stauth.Authenticate(
-    config['usernames'],
-    config['cookie_name'],
-    config['cookie_key'],
-    config['cookie_expiry_days']
-)
+    st.secrets["credentials"]["usernames"].to_dict(),
+    st.secrets["credentials"]["cookie_name"],
+    st.secrets["credentials"]["cookie_key"],
+    st.secrets["credentials"]["cookie_expiry_days"]
+))
 
 # Login widget
 name, authentication_status, username = authenticator.login('Login', 'main')
