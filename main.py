@@ -217,7 +217,17 @@ def format_invoice(invoice):
         "invoice_number": invoice.invoice_number,
         "invoice_date": invoice.invoice_date,
         "total_amount": invoice.total_amount,
+        "subtotal": invoice.subtotal,
         "filename": invoice.filename,
+        
+        # Tax breakdown
+        "gst": invoice.gst,
+        "pst": invoice.pst,
+        "hst": invoice.hst,
+        "qst": invoice.qst,
+        "us_tax": invoice.us_tax,
+        "tax_total": invoice.tax_total,
+        "tax_notes": invoice.tax_notes,
         
         # Workflow fields
         "current_stage": invoice.current_stage,
@@ -271,7 +281,14 @@ async def precode_invoice(
     po_number: str = None,
     receipt_number: str = None,
     precoder: str = None,
-    notes: str = None
+    notes: str = None,
+    gst: float = None,
+    pst: float = None,
+    hst: float = None,
+    qst: float = None,
+    us_tax: float = None,
+    tax_total: float = None,
+    tax_notes: str = None
 ):
     """Complete pre-coding and move to Stage 3 (Dept Review)"""
     
@@ -293,6 +310,15 @@ async def precode_invoice(
         invoice.precoder = precoder
         invoice.precoding_date = datetime.utcnow()
         invoice.precoding_notes = notes
+        
+        # Update tax fields
+        invoice.gst = gst
+        invoice.pst = pst
+        invoice.hst = hst
+        invoice.qst = qst
+        invoice.us_tax = us_tax
+        invoice.tax_total = tax_total
+        invoice.tax_notes = tax_notes
         
         # Advance to Stage 3
         invoice.current_stage = 3

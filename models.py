@@ -22,7 +22,15 @@ class Invoice(Base):
     invoice_number = Column(String, nullable=True)
     total_amount = Column(Float, nullable=True)
     subtotal = Column(Float, nullable=True)
-    tax = Column(Float, nullable=True)
+    
+    # Canadian tax breakdown
+    gst = Column(Float, nullable=True)  # 5% Federal Goods & Services Tax
+    pst = Column(Float, nullable=True)  # Provincial Sales Tax (varies by province)
+    hst = Column(Float, nullable=True)  # Harmonized Sales Tax (GST+PST combined)
+    qst = Column(Float, nullable=True)  # Quebec Sales Tax
+    us_tax = Column(Float, nullable=True)  # For US shipments
+    tax_total = Column(Float, nullable=True)  # Total of all taxes
+    tax_notes = Column(String, nullable=True)  # Notes about tax calculation
     
     # Line items stored as JSON string
     items_json = Column(Text, nullable=True)
