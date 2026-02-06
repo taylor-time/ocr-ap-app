@@ -35,7 +35,6 @@ authenticator = stauth.Authenticate(
     "crew_invoice_ocr_key_12345",
     30
 )
-)
 
 # Login widget
 name, authentication_status, username = authenticator.login('Login', 'main')
