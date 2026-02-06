@@ -5,19 +5,20 @@ FastAPI backend for retail/grocery invoice management with Azure OCR processing 
 import os
 import logging
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from azure_ocr import analyze_invoice_from_bytes, AzureOCRError
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy.orm import Session
-from database import engine, get_db
+from database import engine, SessionLocal
 from models import Invoice
 from init_db import init_database
 
@@ -44,6 +45,40 @@ DEPARTMENT_MANAGERS = {
 }
 
 DEPARTMENTS = list(DEPARTMENT_MANAGERS.keys())
+
+
+# ========== PYDANTIC REQUEST MODELS ==========
+class PrecodeRequest(BaseModel):
+    gl_account: str
+    cost_center: str
+    department: str
+    po_number: Optional[str] = None
+    receipt_number: Optional[str] = None
+    precoder: Optional[str] = None
+    notes: Optional[str] = None
+    gst: Optional[float] = None
+    pst: Optional[float] = None
+    hst: Optional[float] = None
+    qst: Optional[float] = None
+    us_tax: Optional[float] = None
+    tax_total: Optional[float] = None
+    tax_notes: Optional[str] = None
+
+
+class DeptApproveRequest(BaseModel):
+    reviewer: str
+    notes: Optional[str] = None
+
+
+class DeptRejectRequest(BaseModel):
+    reviewer: str
+    notes: str
+
+
+def get_db_session() -> Session:
+    """Create a new database session (caller must close it)."""
+    return SessionLocal()
+
 
 app = FastAPI(
     title="Retail Invoice Management API",
@@ -128,54 +163,53 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
 
         # Remove raw SDK result from response (not JSON serializable)
         result.pop("raw", None)
-        
-        # Save to database
-        db_gen = get_db()
-        db = next(db_gen)
-        try:
-            invoice = Invoice(
-                source="ocr",
-                filename=file.filename,
-                status="success",
-                vendor_name=result.get("vendor_name"),
-                invoice_date=result.get("invoice_date"),
-                invoice_number=result.get("invoice_id"),
-                total_amount=result.get("total"),
-                subtotal=result.get("subtotal"),
-                # Tax will be entered during pre-coding
-                items_json=json.dumps(result.get("items", [])),
-                raw_ocr_data=json.dumps(result)
-            )
-            db.add(invoice)
-            db.commit()
-            db.refresh(invoice)
-            logger.info(f"Invoice saved to database with ID: {invoice.id}")
-        except Exception as db_error:
-            logger.error(f"Database save failed: {db_error}")
-            db.rollback()
-            raise HTTPException(status_code=500, detail=f"Database error: {str(db_error)}")
-        finally:
-            db.close()
-        
-        return JSONResponse(
-            status_code=200,
-            content={
-                "success": True,
-                "data": result,
-                "item_count": len(result.get("items", [])),
-                "filename": file.filename,
-            },
-        )
 
     except AzureOCRError as e:
         logger.error(f"OCR processing failed: {e}")
         raise HTTPException(status_code=500, detail=f"OCR processing failed: {str(e)}")
 
+    # Save to database (separate from OCR try/except)
+    db = get_db_session()
+    try:
+        invoice = Invoice(
+            source="ocr",
+            filename=file.filename,
+            status="success",
+            vendor_name=result.get("vendor_name"),
+            invoice_date=result.get("invoice_date"),
+            invoice_number=result.get("invoice_id"),
+            total_amount=result.get("total"),
+            subtotal=result.get("subtotal"),
+            items_json=json.dumps(result.get("items", [])),
+            raw_ocr_data=json.dumps(result)
+        )
+        db.add(invoice)
+        db.commit()
+        db.refresh(invoice)
+        logger.info(f"Invoice saved to database with ID: {invoice.id}")
+    except Exception as db_error:
+        db.rollback()
+        logger.error(f"Database save failed: {db_error}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(db_error)}")
+    finally:
+        db.close()
+
+    # Return OUTSIDE the try/except/finally so db.close() has already run cleanly
+    return JSONResponse(
+        status_code=200,
+        content={
+            "success": True,
+            "data": result,
+            "item_count": len(result.get("items", [])),
+            "filename": file.filename,
+        },
+    )
+
 
 @app.get("/recent-invoices")
 async def get_recent_invoices(limit: int = 100):
     """Fetch recent invoice uploads from database"""
-    db = next(get_db())
+    db = get_db_session()
     try:
         invoices = db.query(Invoice).order_by(Invoice.created_at.desc()).limit(limit).all()
         
@@ -193,19 +227,19 @@ async def get_recent_invoices(limit: int = 100):
                 "invoice_number": inv.invoice_number,
                 "total_amount": inv.total_amount,
                 "subtotal": inv.subtotal,
-                "tax": inv.tax,
+                "tax": inv.tax_total,
                 "items": json.loads(inv.items_json) if inv.items_json else [],
             })
-        
-        return JSONResponse(
-            status_code=200,
-            content={"success": True, "count": len(result), "invoices": result}
-        )
     except Exception as e:
         logger.error(f"Failed to fetch invoices: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch invoices")
     finally:
         db.close()
+
+    return JSONResponse(
+        status_code=200,
+        content={"success": True, "count": len(result), "invoices": result}
+    )
 
 
 # ========== HELPER FUNCTION ==========
@@ -257,14 +291,14 @@ def format_invoice(invoice):
 @app.get("/api/invoices/precoding-queue")
 async def get_precoding_queue():
     """Get all invoices waiting for pre-coding (stage 1)"""
-    db = next(get_db())
+    db = get_db_session()
     try:
         invoices = db.query(Invoice).filter(
             Invoice.current_stage == 1,
             Invoice.stage_status == "captured"
         ).order_by(Invoice.created_at.desc()).all()
         
-        return {
+        response = {
             "success": True,
             "count": len(invoices),
             "invoices": [format_invoice(inv) for inv in invoices]
@@ -272,71 +306,57 @@ async def get_precoding_queue():
     finally:
         db.close()
 
+    return response
+
 
 @app.post("/api/invoices/{invoice_id}/precode")
-async def precode_invoice(
-    invoice_id: int,
-    gl_account: str,
-    cost_center: str,
-    department: str,
-    po_number: str = None,
-    receipt_number: str = None,
-    precoder: str = None,
-    notes: str = None,
-    gst: float = None,
-    pst: float = None,
-    hst: float = None,
-    qst: float = None,
-    us_tax: float = None,
-    tax_total: float = None,
-    tax_notes: str = None
-):
+async def precode_invoice(invoice_id: int, body: PrecodeRequest):
     """Complete pre-coding and move to Stage 3 (Dept Review)"""
     
-    if department not in DEPARTMENTS:
+    if body.department not in DEPARTMENTS:
         raise HTTPException(400, f"Invalid department. Must be one of: {', '.join(DEPARTMENTS)}")
     
-    db = next(get_db())
+    db = get_db_session()
     try:
         invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
         if not invoice:
             raise HTTPException(404, "Invoice not found")
         
         # Update pre-coding fields
-        invoice.gl_account = gl_account
-        invoice.cost_center = cost_center
-        invoice.department = department
-        invoice.po_number = po_number
-        invoice.receipt_number = receipt_number
-        invoice.precoder = precoder
-        invoice.precoding_date = datetime.utcnow()
-        invoice.precoding_notes = notes
+        invoice.gl_account = body.gl_account
+        invoice.cost_center = body.cost_center
+        invoice.department = body.department
+        invoice.po_number = body.po_number
+        invoice.receipt_number = body.receipt_number
+        invoice.precoder = body.precoder
+        invoice.precoding_date = datetime.now(timezone.utc)
+        invoice.precoding_notes = body.notes
         
         # Update tax fields
-        invoice.gst = gst
-        invoice.pst = pst
-        invoice.hst = hst
-        invoice.qst = qst
-        invoice.us_tax = us_tax
-        invoice.tax_total = tax_total
-        invoice.tax_notes = tax_notes
+        invoice.gst = body.gst
+        invoice.pst = body.pst
+        invoice.hst = body.hst
+        invoice.qst = body.qst
+        invoice.us_tax = body.us_tax
+        invoice.tax_total = body.tax_total
+        invoice.tax_notes = body.tax_notes
         
         # Advance to Stage 3
         invoice.current_stage = 3
         invoice.stage_status = "dept_review"
         
         # Auto-assign to department manager
-        invoice.dept_reviewer = DEPARTMENT_MANAGERS[department]
-        invoice.dept_assigned_date = datetime.utcnow()
+        invoice.dept_reviewer = DEPARTMENT_MANAGERS[body.department]
+        invoice.dept_assigned_date = datetime.now(timezone.utc)
         invoice.dept_status = "pending"
         
-        invoice.last_updated = datetime.utcnow()
-        invoice.last_updated_by = precoder
+        invoice.last_updated = datetime.now(timezone.utc)
+        invoice.last_updated_by = body.precoder
         
         db.commit()
         db.refresh(invoice)
         
-        return {
+        response = {
             "success": True,
             "message": f"Invoice pre-coded and assigned to {invoice.dept_reviewer}",
             "invoice": format_invoice(invoice)
@@ -350,13 +370,15 @@ async def precode_invoice(
     finally:
         db.close()
 
+    return response
+
 
 # ========== STAGE 3: DEPARTMENT REVIEW ENDPOINTS ==========
 
 @app.get("/api/invoices/dept-queue/{reviewer_name}")
 async def get_dept_queue(reviewer_name: str):
     """Get invoices pending review for a specific manager"""
-    db = next(get_db())
+    db = get_db_session()
     try:
         invoices = db.query(Invoice).filter(
             Invoice.current_stage == 3,
@@ -365,7 +387,7 @@ async def get_dept_queue(reviewer_name: str):
             Invoice.dept_status == "pending"
         ).order_by(Invoice.dept_assigned_date.desc()).all()
         
-        return {
+        response = {
             "success": True,
             "reviewer": reviewer_name,
             "count": len(invoices),
@@ -374,35 +396,33 @@ async def get_dept_queue(reviewer_name: str):
     finally:
         db.close()
 
+    return response
+
 
 @app.post("/api/invoices/{invoice_id}/dept-approve")
-async def dept_approve_invoice(
-    invoice_id: int,
-    reviewer: str,
-    notes: str = None
-):
+async def dept_approve_invoice(invoice_id: int, body: DeptApproveRequest):
     """Department manager approves invoice"""
-    db = next(get_db())
+    db = get_db_session()
     try:
         invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
         if not invoice:
             raise HTTPException(404, "Invoice not found")
         
-        if invoice.dept_reviewer != reviewer:
+        if invoice.dept_reviewer != body.reviewer:
             raise HTTPException(403, "You are not assigned to review this invoice")
         
         # Approve
         invoice.dept_status = "approved"
-        invoice.dept_review_date = datetime.utcnow()
-        invoice.dept_review_notes = notes
-        invoice.stage_status = "approved"  # Final status for stages 1-3
-        invoice.last_updated = datetime.utcnow()
-        invoice.last_updated_by = reviewer
+        invoice.dept_review_date = datetime.now(timezone.utc)
+        invoice.dept_review_notes = body.notes
+        invoice.stage_status = "approved"
+        invoice.last_updated = datetime.now(timezone.utc)
+        invoice.last_updated_by = body.reviewer
         
         db.commit()
         db.refresh(invoice)
         
-        return {
+        response = {
             "success": True,
             "message": "Invoice approved by department manager",
             "invoice": format_invoice(invoice)
@@ -416,36 +436,34 @@ async def dept_approve_invoice(
     finally:
         db.close()
 
+    return response
+
 
 @app.post("/api/invoices/{invoice_id}/dept-reject")
-async def dept_reject_invoice(
-    invoice_id: int,
-    reviewer: str,
-    notes: str
-):
+async def dept_reject_invoice(invoice_id: int, body: DeptRejectRequest):
     """Department manager rejects invoice - sends back to pre-coding"""
-    db = next(get_db())
+    db = get_db_session()
     try:
         invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
         if not invoice:
             raise HTTPException(404, "Invoice not found")
         
-        if invoice.dept_reviewer != reviewer:
+        if invoice.dept_reviewer != body.reviewer:
             raise HTTPException(403, "You are not assigned to review this invoice")
         
         # Reject and send back to Stage 2
         invoice.dept_status = "rejected"
-        invoice.dept_review_date = datetime.utcnow()
-        invoice.dept_review_notes = notes
+        invoice.dept_review_date = datetime.now(timezone.utc)
+        invoice.dept_review_notes = body.notes
         invoice.current_stage = 2
         invoice.stage_status = "precoding"
-        invoice.last_updated = datetime.utcnow()
-        invoice.last_updated_by = reviewer
+        invoice.last_updated = datetime.now(timezone.utc)
+        invoice.last_updated_by = body.reviewer
         
         db.commit()
         db.refresh(invoice)
         
-        return {
+        response = {
             "success": True,
             "message": "Invoice rejected and sent back for re-coding",
             "invoice": format_invoice(invoice)
@@ -458,6 +476,8 @@ async def dept_reject_invoice(
         raise HTTPException(500, f"Rejection failed: {str(e)}")
     finally:
         db.close()
+
+    return response
 
 
 @app.exception_handler(Exception)
