@@ -33,6 +33,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ========== DEPARTMENT CONFIGURATION ==========
+DEPARTMENT_MANAGERS = {
+    "produce": "Kevin Taylor",
+    "dairy": "Matteo Hermani",
+    "meat": "Kevin Taylor",
+    "cosmetics": "Matteo Hermani",
+    "pets": "Kevin Taylor",
+    "grocery": "Matteo Hermani"
+}
+
+DEPARTMENTS = list(DEPARTMENT_MANAGERS.keys())
+
 app = FastAPI(
     title="Retail Invoice Management API",
     description="Backend API for retail/grocery invoice processing with OCR and price change tracking",
@@ -137,9 +149,20 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
             db.commit()
             db.refresh(invoice)
             logger.info(f"Invoice saved to database with ID: {invoice.id}")
+            
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": True,
+                    "data": result,
+                    "item_count": len(result.get("items", [])),
+                    "filename": file.filename,
+                },
+            )
         except Exception as db_error:
             logger.error(f"Database save failed: {db_error}")
             db.rollback()
+            raise HTTPException(status_code=500, detail=f"Database error: {str(db_error)}")
         finally:
             db.close()
 
@@ -147,15 +170,6 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
         logger.error(f"OCR processing failed: {e}")
         raise HTTPException(status_code=500, detail=f"OCR processing failed: {str(e)}")
 
-        return JSONResponse(
-            status_code=200,
-            content={
-                "success": True,
-                "data": result,
-                "item_count": len(result.get("items", [])),
-                "filename": file.filename,
-            },
-        )
 
 @app.get("/recent-invoices")
 async def get_recent_invoices(limit: int = 100):
@@ -189,6 +203,232 @@ async def get_recent_invoices(limit: int = 100):
     except Exception as e:
         logger.error(f"Failed to fetch invoices: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch invoices")
+    finally:
+        db.close()
+
+
+# ========== HELPER FUNCTION ==========
+def format_invoice(invoice):
+    """Format invoice object for API response"""
+    return {
+        "id": invoice.id,
+        "created_at": invoice.created_at.isoformat() if invoice.created_at else None,
+        "vendor_name": invoice.vendor_name,
+        "invoice_number": invoice.invoice_number,
+        "invoice_date": invoice.invoice_date,
+        "total_amount": invoice.total_amount,
+        "filename": invoice.filename,
+        
+        # Workflow fields
+        "current_stage": invoice.current_stage,
+        "stage_status": invoice.stage_status,
+        
+        # Pre-coding
+        "gl_account": invoice.gl_account,
+        "cost_center": invoice.cost_center,
+        "department": invoice.department,
+        "po_number": invoice.po_number,
+        "precoder": invoice.precoder,
+        "precoding_date": invoice.precoding_date.isoformat() if invoice.precoding_date else None,
+        
+        # Department review
+        "dept_reviewer": invoice.dept_reviewer,
+        "dept_status": invoice.dept_status,
+        "dept_review_date": invoice.dept_review_date.isoformat() if invoice.dept_review_date else None,
+        "dept_review_notes": invoice.dept_review_notes,
+        
+        "items": json.loads(invoice.items_json) if invoice.items_json else []
+    }
+
+
+# ========== STAGE 2: PRE-CODING ENDPOINTS ==========
+
+@app.get("/api/invoices/precoding-queue")
+async def get_precoding_queue():
+    """Get all invoices waiting for pre-coding (stage 1)"""
+    db = next(get_db())
+    try:
+        invoices = db.query(Invoice).filter(
+            Invoice.current_stage == 1,
+            Invoice.stage_status == "captured"
+        ).order_by(Invoice.created_at.desc()).all()
+        
+        return {
+            "success": True,
+            "count": len(invoices),
+            "invoices": [format_invoice(inv) for inv in invoices]
+        }
+    finally:
+        db.close()
+
+
+@app.post("/api/invoices/{invoice_id}/precode")
+async def precode_invoice(
+    invoice_id: int,
+    gl_account: str,
+    cost_center: str,
+    department: str,
+    po_number: str = None,
+    receipt_number: str = None,
+    precoder: str = None,
+    notes: str = None
+):
+    """Complete pre-coding and move to Stage 3 (Dept Review)"""
+    
+    if department not in DEPARTMENTS:
+        raise HTTPException(400, f"Invalid department. Must be one of: {', '.join(DEPARTMENTS)}")
+    
+    db = next(get_db())
+    try:
+        invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+        if not invoice:
+            raise HTTPException(404, "Invoice not found")
+        
+        # Update pre-coding fields
+        invoice.gl_account = gl_account
+        invoice.cost_center = cost_center
+        invoice.department = department
+        invoice.po_number = po_number
+        invoice.receipt_number = receipt_number
+        invoice.precoder = precoder
+        invoice.precoding_date = datetime.utcnow()
+        invoice.precoding_notes = notes
+        
+        # Advance to Stage 3
+        invoice.current_stage = 3
+        invoice.stage_status = "dept_review"
+        
+        # Auto-assign to department manager
+        invoice.dept_reviewer = DEPARTMENT_MANAGERS[department]
+        invoice.dept_assigned_date = datetime.utcnow()
+        invoice.dept_status = "pending"
+        
+        invoice.last_updated = datetime.utcnow()
+        invoice.last_updated_by = precoder
+        
+        db.commit()
+        db.refresh(invoice)
+        
+        return {
+            "success": True,
+            "message": f"Invoice pre-coded and assigned to {invoice.dept_reviewer}",
+            "invoice": format_invoice(invoice)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Pre-coding failed: {e}")
+        raise HTTPException(500, f"Pre-coding failed: {str(e)}")
+    finally:
+        db.close()
+
+
+# ========== STAGE 3: DEPARTMENT REVIEW ENDPOINTS ==========
+
+@app.get("/api/invoices/dept-queue/{reviewer_name}")
+async def get_dept_queue(reviewer_name: str):
+    """Get invoices pending review for a specific manager"""
+    db = next(get_db())
+    try:
+        invoices = db.query(Invoice).filter(
+            Invoice.current_stage == 3,
+            Invoice.stage_status == "dept_review",
+            Invoice.dept_reviewer == reviewer_name,
+            Invoice.dept_status == "pending"
+        ).order_by(Invoice.dept_assigned_date.desc()).all()
+        
+        return {
+            "success": True,
+            "reviewer": reviewer_name,
+            "count": len(invoices),
+            "invoices": [format_invoice(inv) for inv in invoices]
+        }
+    finally:
+        db.close()
+
+
+@app.post("/api/invoices/{invoice_id}/dept-approve")
+async def dept_approve_invoice(
+    invoice_id: int,
+    reviewer: str,
+    notes: str = None
+):
+    """Department manager approves invoice"""
+    db = next(get_db())
+    try:
+        invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+        if not invoice:
+            raise HTTPException(404, "Invoice not found")
+        
+        if invoice.dept_reviewer != reviewer:
+            raise HTTPException(403, "You are not assigned to review this invoice")
+        
+        # Approve
+        invoice.dept_status = "approved"
+        invoice.dept_review_date = datetime.utcnow()
+        invoice.dept_review_notes = notes
+        invoice.stage_status = "approved"  # Final status for stages 1-3
+        invoice.last_updated = datetime.utcnow()
+        invoice.last_updated_by = reviewer
+        
+        db.commit()
+        db.refresh(invoice)
+        
+        return {
+            "success": True,
+            "message": "Invoice approved by department manager",
+            "invoice": format_invoice(invoice)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Approval failed: {e}")
+        raise HTTPException(500, f"Approval failed: {str(e)}")
+    finally:
+        db.close()
+
+
+@app.post("/api/invoices/{invoice_id}/dept-reject")
+async def dept_reject_invoice(
+    invoice_id: int,
+    reviewer: str,
+    notes: str
+):
+    """Department manager rejects invoice - sends back to pre-coding"""
+    db = next(get_db())
+    try:
+        invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+        if not invoice:
+            raise HTTPException(404, "Invoice not found")
+        
+        if invoice.dept_reviewer != reviewer:
+            raise HTTPException(403, "You are not assigned to review this invoice")
+        
+        # Reject and send back to Stage 2
+        invoice.dept_status = "rejected"
+        invoice.dept_review_date = datetime.utcnow()
+        invoice.dept_review_notes = notes
+        invoice.current_stage = 2
+        invoice.stage_status = "precoding"
+        invoice.last_updated = datetime.utcnow()
+        invoice.last_updated_by = reviewer
+        
+        db.commit()
+        db.refresh(invoice)
+        
+        return {
+            "success": True,
+            "message": "Invoice rejected and sent back for re-coding",
+            "invoice": format_invoice(invoice)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Rejection failed: {e}")
+        raise HTTPException(500, f"Rejection failed: {str(e)}")
     finally:
         db.close()
 
