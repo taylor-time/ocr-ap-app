@@ -1,5 +1,6 @@
+# file: init_db.py
 from database import engine, Base
-from models import Invoice
+from models import Invoice, PriceHistory, PriceChange
 
 def init_database():
     """Create all database tables"""
