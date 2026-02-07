@@ -359,11 +359,45 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
     # Extract tax from OCR result (azure_ocr.py returns "tax_total" from Azure's TotalTax field)
     ocr_tax = clean_price(result.get("tax_total"))
 
+    # Auto-detect tax type from raw OCR text content
+    # Azure returns the full text — look for GST/HST/PST keywords to classify
+    ocr_gst = None
+    ocr_pst = None
+    ocr_hst = None
+    ocr_tax_notes = None
+    
+    if ocr_tax and ocr_tax > 0:
+        raw_text = json.dumps(result).upper()  # search all OCR output
+        
+        if "HST" in raw_text:
+            ocr_hst = ocr_tax
+            ocr_tax_notes = "HST (auto-detected from OCR)"
+        elif "GST" in raw_text and "PST" in raw_text:
+            # GST+PST province — estimate split (GST=5%, PST varies)
+            # Use subtotal to calculate if available
+            if subtotal and subtotal > 0:
+                ocr_gst = round(subtotal * 0.05, 2)
+                ocr_pst = round(ocr_tax - ocr_gst, 2)
+                if ocr_pst < 0:
+                    ocr_pst = None
+                    ocr_gst = ocr_tax
+            else:
+                ocr_gst = ocr_tax  # fallback: put it all in GST
+            ocr_tax_notes = "GST+PST (auto-detected from OCR)"
+        elif "GST" in raw_text:
+            ocr_gst = ocr_tax
+            ocr_tax_notes = "GST (auto-detected from OCR)"
+        else:
+            # Can't determine type — store as total only
+            ocr_tax_notes = "Tax type unknown (review needed)"
+    
+    logger.info(f"Tax auto-detect: total={ocr_tax}, gst={ocr_gst}, pst={ocr_pst}, hst={ocr_hst}, notes={ocr_tax_notes}")
+
     # Clean line item prices too
     raw_items = result.get("items", [])
     cleaned_items = clean_line_items(raw_items)
 
-    logger.info(f"Cleaned prices - total: {result.get('total')!r} -> {total_amount}, subtotal: {result.get('subtotal')!r} -> {subtotal}, tax: {ocr_tax}")
+    logger.info(f"Cleaned prices - total: {result.get('total')!r} -> {total_amount}, subtotal: {result.get('subtotal')!r} -> {subtotal}")
 
     # Save to database (separate from OCR try/except)
     db = get_db_session()
@@ -378,6 +412,10 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
             total_amount=total_amount,
             subtotal=subtotal,
             tax_total=ocr_tax,
+            gst=ocr_gst,
+            pst=ocr_pst,
+            hst=ocr_hst,
+            tax_notes=ocr_tax_notes,
             items_json=json.dumps(cleaned_items),
             raw_ocr_data=json.dumps(result)
         )
