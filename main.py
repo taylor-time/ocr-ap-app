@@ -5,7 +5,7 @@ FastAPI backend for retail/grocery invoice management with Azure OCR processing 
 import os
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -18,8 +18,9 @@ from azure_ocr import analyze_invoice_from_bytes, AzureOCRError
 import json
 from datetime import datetime
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from database import engine, SessionLocal
-from models import Invoice
+from models import Invoice, PriceHistory, PriceChange
 from init_db import init_database
 
 # --- Load .env explicitly from this project folder (Windows-safe) ---
@@ -75,6 +76,12 @@ class DeptRejectRequest(BaseModel):
     notes: str
 
 
+class PriceChangeReviewRequest(BaseModel):
+    reviewed_by: str
+    review_status: str  # "acknowledged" or "escalated"
+    review_notes: Optional[str] = None
+
+
 def get_db_session() -> Session:
     """Create a new database session (caller must close it)."""
     return SessionLocal()
@@ -102,6 +109,134 @@ def clean_price(value) -> Optional[float]:
             logger.warning(f"Could not parse price value: {value!r}")
             return None
     return None
+
+
+def clean_line_items(items: list) -> list:
+    """Clean all price fields in OCR line items so they are proper floats."""
+    cleaned = []
+    for item in items:
+        cleaned_item = dict(item)  # shallow copy
+        cleaned_item["unit_price"] = clean_price(item.get("unit_price"))
+        cleaned_item["line_total"] = clean_price(item.get("line_total"))
+        cleaned_item["tax_amount"] = clean_price(item.get("tax_amount"))
+        # Clean quantity too (sometimes comes as string)
+        qty = item.get("quantity")
+        if qty is not None:
+            try:
+                cleaned_item["quantity"] = float(str(qty).replace(",", ""))
+            except (ValueError, TypeError):
+                cleaned_item["quantity"] = None
+        cleaned.append(cleaned_item)
+    return cleaned
+
+
+def save_price_history(db: Session, invoice: Invoice):
+    """Save all line items from an approved invoice into price_history for future comparisons."""
+    items = json.loads(invoice.items_json) if invoice.items_json else []
+    if not items or not invoice.vendor_name:
+        return
+
+    count = 0
+    for item in items:
+        description = (item.get("description") or "").strip()
+        if not description:
+            continue
+
+        ph = PriceHistory(
+            invoice_id=invoice.id,
+            vendor_name=invoice.vendor_name.strip(),
+            item_description=description,
+            item_sku=item.get("sku") or None,
+            unit_price=clean_price(item.get("unit_price")),
+            quantity=float(item["quantity"]) if item.get("quantity") else None,
+            unit=item.get("unit") or None,
+            line_total=clean_price(item.get("line_total")),
+            invoice_date=invoice.invoice_date,
+            department=invoice.department,
+        )
+        db.add(ph)
+        count += 1
+
+    logger.info(f"Saved {count} price history records for invoice {invoice.id} ({invoice.vendor_name})")
+
+
+def detect_price_changes(db: Session, invoice: Invoice) -> int:
+    """Compare line items against the most recent previous invoice from the same vendor.
+    Creates PriceChange records for any differences. Returns count of changes found."""
+    items = json.loads(invoice.items_json) if invoice.items_json else []
+    if not items or not invoice.vendor_name:
+        return 0
+
+    vendor = invoice.vendor_name.strip()
+
+    # Find the most recent previous invoice ID from this vendor (not the current one)
+    prev_invoice = db.query(Invoice).filter(
+        Invoice.vendor_name == vendor,
+        Invoice.id != invoice.id,
+        Invoice.stage_status.in_(["approved", "price_review", "complete"])
+    ).order_by(Invoice.created_at.desc()).first()
+
+    if not prev_invoice:
+        logger.info(f"No previous invoice found for vendor '{vendor}' - skipping price comparison")
+        return 0
+
+    # Build a lookup of previous prices: description -> PriceHistory record
+    prev_prices = {}
+    prev_history = db.query(PriceHistory).filter(
+        PriceHistory.invoice_id == prev_invoice.id
+    ).all()
+
+    for ph in prev_history:
+        key = ph.item_description.strip().lower()
+        prev_prices[key] = ph
+
+    # Compare each current item against previous
+    changes_found = 0
+    for item in items:
+        description = (item.get("description") or "").strip()
+        if not description:
+            continue
+
+        current_price = clean_price(item.get("unit_price"))
+        if current_price is None:
+            continue
+
+        key = description.lower()
+        prev = prev_prices.get(key)
+
+        if not prev or prev.unit_price is None:
+            continue  # New item or no previous price — not a change
+
+        if abs(current_price - prev.unit_price) < 0.001:
+            continue  # Same price — no change
+
+        # Price changed — create record
+        diff = current_price - prev.unit_price
+        pct = (diff / prev.unit_price) * 100 if prev.unit_price != 0 else 0
+
+        pc = PriceChange(
+            invoice_id=invoice.id,
+            previous_invoice_id=prev_invoice.id,
+            vendor_name=vendor,
+            item_description=description,
+            item_sku=item.get("sku") or None,
+            department=invoice.department,
+            previous_price=prev.unit_price,
+            new_price=current_price,
+            price_difference=round(diff, 2),
+            percent_change=round(pct, 2),
+            previous_invoice_date=prev_invoice.invoice_date,
+            new_invoice_date=invoice.invoice_date,
+        )
+        db.add(pc)
+        changes_found += 1
+
+        logger.info(
+            f"Price change detected: {vendor} / {description}: "
+            f"${prev.unit_price:.2f} -> ${current_price:.2f} ({pct:+.1f}%)"
+        )
+
+    return changes_found
 
 
 app = FastAPI(
@@ -196,6 +331,10 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
     total_amount = clean_price(result.get("total"))
     subtotal = clean_price(result.get("subtotal"))
 
+    # Clean line item prices too
+    raw_items = result.get("items", [])
+    cleaned_items = clean_line_items(raw_items)
+
     logger.info(f"Cleaned prices - total: {result.get('total')!r} -> {total_amount}, subtotal: {result.get('subtotal')!r} -> {subtotal}")
 
     # Save to database (separate from OCR try/except)
@@ -210,7 +349,7 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
             invoice_number=result.get("invoice_id"),
             total_amount=total_amount,
             subtotal=subtotal,
-            items_json=json.dumps(result.get("items", [])),
+            items_json=json.dumps(cleaned_items),
             raw_ocr_data=json.dumps(result)
         )
         db.add(invoice)
@@ -230,7 +369,7 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
         content={
             "success": True,
             "data": result,
-            "item_count": len(result.get("items", [])),
+            "item_count": len(cleaned_items),
             "filename": file.filename,
         },
     )
@@ -311,6 +450,10 @@ def format_invoice(invoice):
         "dept_status": invoice.dept_status,
         "dept_review_date": invoice.dept_review_date.isoformat() if invoice.dept_review_date else None,
         "dept_review_notes": invoice.dept_review_notes,
+        
+        # Price change info
+        "price_changes_detected": invoice.price_changes_detected,
+        "price_change_count": invoice.price_change_count,
         
         "items": json.loads(invoice.items_json) if invoice.items_json else []
     }
@@ -431,7 +574,7 @@ async def get_dept_queue(reviewer_name: str):
 
 @app.post("/api/invoices/{invoice_id}/dept-approve")
 async def dept_approve_invoice(invoice_id: int, body: DeptApproveRequest):
-    """Department manager approves invoice"""
+    """Department manager approves invoice — triggers price history save + change detection"""
     db = get_db_session()
     try:
         invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
@@ -441,20 +584,41 @@ async def dept_approve_invoice(invoice_id: int, body: DeptApproveRequest):
         if invoice.dept_reviewer != body.reviewer:
             raise HTTPException(403, "You are not assigned to review this invoice")
         
-        # Approve
+        # Approve the invoice
         invoice.dept_status = "approved"
         invoice.dept_review_date = datetime.utcnow()
         invoice.dept_review_notes = body.notes
-        invoice.stage_status = "approved"
         invoice.last_updated = datetime.utcnow()
         invoice.last_updated_by = body.reviewer
+        
+        # ===== STAGE 4: PRICE TRACKING (runs automatically) =====
+        # 1. Save all line item prices to history
+        save_price_history(db, invoice)
+        
+        # 2. Detect price changes vs. previous invoice from same vendor
+        change_count = detect_price_changes(db, invoice)
+        
+        if change_count > 0:
+            # Price changes found — move to Stage 4 for GM review
+            invoice.current_stage = 4
+            invoice.stage_status = "price_review"
+            invoice.price_changes_detected = True
+            invoice.price_change_count = change_count
+            message = f"Invoice approved. {change_count} price change(s) detected — sent to GM for review."
+        else:
+            # No changes — invoice is fully complete
+            invoice.stage_status = "approved"
+            invoice.price_changes_detected = False
+            invoice.price_change_count = 0
+            message = "Invoice approved. No price changes detected."
         
         db.commit()
         db.refresh(invoice)
         
         response = {
             "success": True,
-            "message": "Invoice approved by department manager",
+            "message": message,
+            "price_changes_found": change_count,
             "invoice": format_invoice(invoice)
         }
     except HTTPException:
@@ -504,6 +668,198 @@ async def dept_reject_invoice(invoice_id: int, body: DeptRejectRequest):
         db.rollback()
         logger.error(f"Rejection failed: {e}")
         raise HTTPException(500, f"Rejection failed: {str(e)}")
+    finally:
+        db.close()
+
+    return response
+
+
+# ========== STAGE 4: PRICE CHANGE REVIEW ENDPOINTS ==========
+
+@app.get("/api/price-changes/pending")
+async def get_pending_price_changes():
+    """Get all pending price changes for GM review, grouped by vendor"""
+    db = get_db_session()
+    try:
+        changes = db.query(PriceChange).filter(
+            PriceChange.review_status == "pending"
+        ).order_by(PriceChange.vendor_name, PriceChange.created_at.desc()).all()
+        
+        # Group by vendor
+        vendors = {}
+        for pc in changes:
+            if pc.vendor_name not in vendors:
+                vendors[pc.vendor_name] = {
+                    "vendor_name": pc.vendor_name,
+                    "department": pc.department,
+                    "change_count": 0,
+                    "total_impact": 0.0,
+                    "changes": []
+                }
+            vendors[pc.vendor_name]["change_count"] += 1
+            vendors[pc.vendor_name]["total_impact"] += pc.price_difference
+            vendors[pc.vendor_name]["changes"].append({
+                "id": pc.id,
+                "item_description": pc.item_description,
+                "item_sku": pc.item_sku,
+                "previous_price": pc.previous_price,
+                "new_price": pc.new_price,
+                "price_difference": pc.price_difference,
+                "percent_change": pc.percent_change,
+                "previous_invoice_date": pc.previous_invoice_date,
+                "new_invoice_date": pc.new_invoice_date,
+                "invoice_id": pc.invoice_id,
+                "previous_invoice_id": pc.previous_invoice_id,
+                "review_status": pc.review_status,
+            })
+        
+        response = {
+            "success": True,
+            "vendor_count": len(vendors),
+            "total_changes": len(changes),
+            "vendors": list(vendors.values())
+        }
+    finally:
+        db.close()
+
+    return response
+
+
+@app.post("/api/price-changes/{change_id}/review")
+async def review_price_change(change_id: int, body: PriceChangeReviewRequest):
+    """GM acknowledges or escalates a single price change"""
+    if body.review_status not in ("acknowledged", "escalated"):
+        raise HTTPException(400, "review_status must be 'acknowledged' or 'escalated'")
+    
+    db = get_db_session()
+    try:
+        pc = db.query(PriceChange).filter(PriceChange.id == change_id).first()
+        if not pc:
+            raise HTTPException(404, "Price change not found")
+        
+        pc.review_status = body.review_status
+        pc.reviewed_by = body.reviewed_by
+        pc.reviewed_at = datetime.utcnow()
+        pc.review_notes = body.review_notes
+        
+        # Check if all changes for this invoice are now reviewed
+        remaining = db.query(PriceChange).filter(
+            PriceChange.invoice_id == pc.invoice_id,
+            PriceChange.review_status == "pending"
+        ).count()
+        
+        # If this was the last pending change, mark invoice as complete
+        if remaining == 0:
+            invoice = db.query(Invoice).filter(Invoice.id == pc.invoice_id).first()
+            if invoice:
+                invoice.stage_status = "complete"
+                invoice.last_updated = datetime.utcnow()
+                invoice.last_updated_by = body.reviewed_by
+                logger.info(f"All price changes reviewed for invoice {invoice.id} — marked complete")
+        
+        db.commit()
+        
+        response = {
+            "success": True,
+            "message": f"Price change {body.review_status}",
+            "remaining_pending": remaining
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Price change review failed: {e}")
+        raise HTTPException(500, f"Review failed: {str(e)}")
+    finally:
+        db.close()
+
+    return response
+
+
+@app.post("/api/price-changes/review-bulk")
+async def review_price_changes_bulk(invoice_id: int, body: PriceChangeReviewRequest):
+    """GM acknowledges or escalates ALL pending price changes for an invoice at once"""
+    if body.review_status not in ("acknowledged", "escalated"):
+        raise HTTPException(400, "review_status must be 'acknowledged' or 'escalated'")
+    
+    db = get_db_session()
+    try:
+        changes = db.query(PriceChange).filter(
+            PriceChange.invoice_id == invoice_id,
+            PriceChange.review_status == "pending"
+        ).all()
+        
+        if not changes:
+            raise HTTPException(404, "No pending price changes found for this invoice")
+        
+        for pc in changes:
+            pc.review_status = body.review_status
+            pc.reviewed_by = body.reviewed_by
+            pc.reviewed_at = datetime.utcnow()
+            pc.review_notes = body.review_notes
+        
+        # Mark invoice as complete
+        invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+        if invoice:
+            invoice.stage_status = "complete"
+            invoice.last_updated = datetime.utcnow()
+            invoice.last_updated_by = body.reviewed_by
+        
+        db.commit()
+        
+        response = {
+            "success": True,
+            "message": f"{len(changes)} price change(s) {body.review_status}",
+            "count": len(changes)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Bulk review failed: {e}")
+        raise HTTPException(500, f"Bulk review failed: {str(e)}")
+    finally:
+        db.close()
+
+    return response
+
+
+@app.get("/api/price-changes/history")
+async def get_price_change_history(vendor_name: Optional[str] = None, limit: int = 50):
+    """View reviewed price changes (history). Optionally filter by vendor."""
+    db = get_db_session()
+    try:
+        query = db.query(PriceChange).filter(
+            PriceChange.review_status != "pending"
+        )
+        if vendor_name:
+            query = query.filter(PriceChange.vendor_name == vendor_name)
+        
+        changes = query.order_by(PriceChange.reviewed_at.desc()).limit(limit).all()
+        
+        result = []
+        for pc in changes:
+            result.append({
+                "id": pc.id,
+                "vendor_name": pc.vendor_name,
+                "item_description": pc.item_description,
+                "previous_price": pc.previous_price,
+                "new_price": pc.new_price,
+                "price_difference": pc.price_difference,
+                "percent_change": pc.percent_change,
+                "review_status": pc.review_status,
+                "reviewed_by": pc.reviewed_by,
+                "reviewed_at": pc.reviewed_at.isoformat() if pc.reviewed_at else None,
+                "review_notes": pc.review_notes,
+                "new_invoice_date": pc.new_invoice_date,
+                "previous_invoice_date": pc.previous_invoice_date,
+            })
+        
+        response = {
+            "success": True,
+            "count": len(result),
+            "changes": result
+        }
     finally:
         db.close()
 
