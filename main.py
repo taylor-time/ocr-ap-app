@@ -44,7 +44,9 @@ DEPARTMENT_MANAGERS = {
     "meat": "Kevin Taylor",
     "cosmetics": "Matteo Hermani",
     "pets": "Kevin Taylor",
-    "grocery": "Matteo Hermani"
+    "grocery": "Matteo Hermani",
+    "bakery": "Kevin Taylor",
+    "contractor": "Kevin Taylor"
 }
 
 DEPARTMENTS = list(DEPARTMENT_MANAGERS.keys())
