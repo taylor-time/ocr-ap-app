@@ -261,6 +261,27 @@ async def startup_event():
     try:
         init_database()
         logger.info("Database initialized successfully")
+        
+        # Auto-migrate: add any missing columns to existing tables
+        from sqlalchemy import text, inspect
+        with engine.connect() as conn:
+            inspector = inspect(engine)
+            
+            # Check invoices table for new columns
+            existing_cols = {col["name"] for col in inspector.get_columns("invoices")}
+            
+            migrations = {
+                "price_changes_detected": "ALTER TABLE invoices ADD COLUMN price_changes_detected BOOLEAN DEFAULT FALSE",
+                "price_change_count": "ALTER TABLE invoices ADD COLUMN price_change_count INTEGER DEFAULT 0",
+            }
+            
+            for col_name, sql in migrations.items():
+                if col_name not in existing_cols:
+                    conn.execute(text(sql))
+                    logger.info(f"Added missing column: invoices.{col_name}")
+            
+            conn.commit()
+        
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
 
