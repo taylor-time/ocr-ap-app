@@ -16,6 +16,8 @@ from pydantic import BaseModel
 
 from azure_ocr import analyze_invoice_from_bytes, AzureOCRError
 import json
+import csv
+import io
 from datetime import datetime
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -863,6 +865,164 @@ async def get_price_change_history(vendor_name: Optional[str] = None, limit: int
     finally:
         db.close()
 
+    return response
+
+
+# ========== CSV IMPORT ENDPOINT ==========
+
+@app.post("/api/import-csv")
+async def import_csv(file: UploadFile = File(...)):
+    """Import invoices from CSV file. Groups rows by invoice_number,
+    creates Invoice records with line items, and populates price_history.
+    Invoices are imported as fully approved so price history is available for comparisons."""
+    
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(400, "Only CSV files are accepted")
+    
+    content = await file.read()
+    text = content.decode("utf-8-sig")  # handle BOM if present
+    reader = csv.DictReader(io.StringIO(text))
+    
+    # Group rows by invoice_number
+    invoice_groups = {}
+    for row in reader:
+        inv_num = row.get("invoice_number", "").strip()
+        if not inv_num:
+            continue
+        if inv_num not in invoice_groups:
+            invoice_groups[inv_num] = {
+                "header": row,
+                "items": []
+            }
+        invoice_groups[inv_num]["items"].append(row)
+    
+    if not invoice_groups:
+        raise HTTPException(400, "No valid invoice data found in CSV")
+    
+    db = get_db_session()
+    created_count = 0
+    skipped_count = 0
+    
+    try:
+        # Sort by invoice_date so price history is chronological
+        sorted_invoices = sorted(
+            invoice_groups.items(),
+            key=lambda x: x[1]["header"].get("invoice_date", "")
+        )
+        
+        for inv_num, group in sorted_invoices:
+            header = group["header"]
+            items = group["items"]
+            
+            # Check if invoice already exists
+            existing = db.query(Invoice).filter(Invoice.invoice_number == inv_num).first()
+            if existing:
+                skipped_count += 1
+                continue
+            
+            # Build line items JSON
+            line_items = []
+            for item in items:
+                line_items.append({
+                    "description": item.get("item_description", "").strip(),
+                    "sku": item.get("item_code", "").strip(),
+                    "quantity": float(item.get("quantity", 0) or 0),
+                    "unit": item.get("uom", "").strip(),
+                    "unit_price": float(item.get("unit_price_cad", 0) or 0),
+                    "line_total": float(item.get("line_total_cad", 0) or 0),
+                    "tax_amount": None,
+                    "date": None,
+                })
+            
+            # Parse tax amounts
+            gst_amt = float(header.get("gst_amount_cad", 0) or 0)
+            pst_amt = float(header.get("pst_amount_cad", 0) or 0)
+            hst_amt = float(header.get("hst_amount_cad", 0) or 0)
+            tax_total = float(header.get("total_tax_cad", 0) or 0)
+            
+            vendor_name = header.get("vendor_name", "").strip()
+            department = header.get("invoice_department", "").strip().lower()
+            
+            # Determine department manager
+            dept_reviewer = DEPARTMENT_MANAGERS.get(department)
+            
+            # Create invoice as fully approved (Stage 3 complete)
+            invoice = Invoice(
+                source="csv_import",
+                filename=header.get("filename", "").strip(),
+                status="success",
+                vendor_name=vendor_name,
+                invoice_date=header.get("invoice_date", "").strip(),
+                invoice_number=inv_num,
+                total_amount=float(header.get("invoice_total_cad", 0) or 0),
+                subtotal=float(header.get("subtotal_cad", 0) or 0),
+                items_json=json.dumps(line_items),
+                
+                # Tax
+                gst=gst_amt if gst_amt > 0 else None,
+                pst=pst_amt if pst_amt > 0 else None,
+                hst=hst_amt if hst_amt > 0 else None,
+                tax_total=tax_total if tax_total > 0 else None,
+                tax_notes=header.get("tax_notes", "").strip() or None,
+                
+                # Pre-coding (auto-filled from CSV)
+                department=department,
+                gl_account="CSV-IMPORT",
+                cost_center="CSV-IMPORT",
+                precoder="CSV Import",
+                precoding_date=datetime.utcnow(),
+                
+                # Dept review (auto-approved)
+                dept_reviewer=dept_reviewer,
+                dept_status="approved",
+                dept_review_date=datetime.utcnow(),
+                dept_review_notes="Auto-approved via CSV import",
+                
+                # Stage: fully approved
+                current_stage=3,
+                stage_status="approved",
+            )
+            
+            db.add(invoice)
+            db.flush()  # get the invoice.id
+            
+            # Save price history for each line item
+            for item in line_items:
+                desc = item.get("description", "").strip()
+                if not desc:
+                    continue
+                ph = PriceHistory(
+                    invoice_id=invoice.id,
+                    vendor_name=vendor_name,
+                    item_description=desc,
+                    item_sku=item.get("sku") or None,
+                    unit_price=item.get("unit_price"),
+                    quantity=item.get("quantity"),
+                    unit=item.get("unit") or None,
+                    line_total=item.get("line_total"),
+                    invoice_date=invoice.invoice_date,
+                    department=department,
+                )
+                db.add(ph)
+            
+            created_count += 1
+        
+        db.commit()
+        
+        response = {
+            "success": True,
+            "message": f"Imported {created_count} invoice(s), skipped {skipped_count} duplicate(s)",
+            "created": created_count,
+            "skipped": skipped_count,
+            "total_in_csv": len(invoice_groups)
+        }
+    except Exception as e:
+        db.rollback()
+        logger.error(f"CSV import failed: {e}")
+        raise HTTPException(500, f"CSV import failed: {str(e)}")
+    finally:
+        db.close()
+    
     return response
 
 
