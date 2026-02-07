@@ -356,11 +356,14 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
     total_amount = clean_price(result.get("total"))
     subtotal = clean_price(result.get("subtotal"))
 
+    # Extract tax from OCR result (azure_ocr.py returns "tax_total" from Azure's TotalTax field)
+    ocr_tax = clean_price(result.get("tax_total"))
+
     # Clean line item prices too
     raw_items = result.get("items", [])
     cleaned_items = clean_line_items(raw_items)
 
-    logger.info(f"Cleaned prices - total: {result.get('total')!r} -> {total_amount}, subtotal: {result.get('subtotal')!r} -> {subtotal}")
+    logger.info(f"Cleaned prices - total: {result.get('total')!r} -> {total_amount}, subtotal: {result.get('subtotal')!r} -> {subtotal}, tax: {ocr_tax}")
 
     # Save to database (separate from OCR try/except)
     db = get_db_session()
@@ -374,6 +377,7 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
             invoice_number=result.get("invoice_id"),
             total_amount=total_amount,
             subtotal=subtotal,
+            tax_total=ocr_tax,
             items_json=json.dumps(cleaned_items),
             raw_ocr_data=json.dumps(result)
         )
@@ -398,6 +402,42 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
             "filename": file.filename,
         },
     )
+
+
+@app.delete("/api/invoices/{invoice_id}")
+async def delete_invoice(invoice_id: int):
+    """Delete an invoice and its related price history and price change records"""
+    db = get_db_session()
+    try:
+        invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+        if not invoice:
+            raise HTTPException(404, "Invoice not found")
+        
+        # Delete related records first (foreign key constraints)
+        db.query(PriceHistory).filter(PriceHistory.invoice_id == invoice_id).delete()
+        db.query(PriceChange).filter(
+            (PriceChange.invoice_id == invoice_id) | (PriceChange.previous_invoice_id == invoice_id)
+        ).delete(synchronize_session=False)
+        
+        vendor = invoice.vendor_name
+        inv_num = invoice.invoice_number
+        db.delete(invoice)
+        db.commit()
+        
+        response = {
+            "success": True,
+            "message": f"Deleted invoice #{inv_num} from {vendor}"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Delete failed: {e}")
+        raise HTTPException(500, f"Delete failed: {str(e)}")
+    finally:
+        db.close()
+    
+    return response
 
 
 @app.get("/recent-invoices")
