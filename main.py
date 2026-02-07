@@ -355,6 +355,25 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
     # Clean price values from OCR (they come back as "$1,533.48" strings)
     total_amount = clean_price(result.get("total"))
     subtotal = clean_price(result.get("subtotal"))
+    
+    # Duplicate detection: check vendor + invoice number
+    ocr_vendor = (result.get("vendor_name") or "").strip()
+    ocr_inv_num = (result.get("invoice_id") or "").strip()
+    
+    if ocr_vendor and ocr_inv_num:
+        dup_db = get_db_session()
+        try:
+            existing = dup_db.query(Invoice).filter(
+                Invoice.vendor_name == ocr_vendor,
+                Invoice.invoice_number == ocr_inv_num
+            ).first()
+            if existing:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Duplicate invoice detected: {ocr_vendor} #{ocr_inv_num} already exists (Invoice ID {existing.id}, uploaded {existing.created_at.strftime('%Y-%m-%d') if existing.created_at else 'unknown'})"
+                )
+        finally:
+            dup_db.close()
 
     # Extract tax from OCR result (azure_ocr.py returns "tax_total" from Azure's TotalTax field)
     ocr_tax = clean_price(result.get("tax_total"))
