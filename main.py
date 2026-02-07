@@ -356,7 +356,8 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
     total_amount = clean_price(result.get("total"))
     subtotal = clean_price(result.get("subtotal"))
     
-    # Duplicate detection: check vendor + invoice number
+    # Duplicate detection: check vendor + invoice number against other OCR uploads only.
+    # CSV imports are historical baseline data for price comparison — not workflow duplicates.
     ocr_vendor = (result.get("vendor_name") or "").strip()
     ocr_inv_num = (result.get("invoice_id") or "").strip()
     
@@ -365,7 +366,8 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
         try:
             existing = dup_db.query(Invoice).filter(
                 Invoice.vendor_name == ocr_vendor,
-                Invoice.invoice_number == ocr_inv_num
+                Invoice.invoice_number == ocr_inv_num,
+                Invoice.source != "csv_import"
             ).first()
             if existing:
                 raise HTTPException(
