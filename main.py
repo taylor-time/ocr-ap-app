@@ -22,7 +22,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from database import engine, SessionLocal
-from models import Invoice, PriceHistory, PriceChange
+from models import Invoice, PriceHistory, PriceChange, ActivityLog
 from init_db import init_database
 
 # --- Load .env explicitly from this project folder (Windows-safe) ---
@@ -89,6 +89,45 @@ class PriceChangeReviewRequest(BaseModel):
 def get_db_session() -> Session:
     """Create a new database session (caller must close it)."""
     return SessionLocal()
+
+
+# ========== ACTIVITY LOG HELPER ==========
+
+class Actions:
+    """Constants for activity log action types."""
+    INVOICE_UPLOADED = "invoice_uploaded"
+    INVOICE_PRECODED = "invoice_precoded"
+    INVOICE_APPROVED = "invoice_approved"
+    INVOICE_REJECTED = "invoice_rejected"
+    INVOICE_DELETED = "invoice_deleted"
+    PRICE_CHANGE_ACKNOWLEDGED = "price_change_acknowledged"
+    PRICE_CHANGE_ESCALATED = "price_change_escalated"
+    PRICE_CHANGES_BULK_REVIEWED = "price_changes_bulk_reviewed"
+    CSV_IMPORTED = "csv_imported"
+
+
+def log_activity(
+    db: Session,
+    actor: str,
+    action: str,
+    target_type: str = None,
+    target_id: int = None,
+    detail: str = None,
+):
+    """Write an entry to the activity_log table."""
+    try:
+        entry = ActivityLog(
+            actor=actor,
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            detail=detail,
+            app_name="ap_processing",
+        )
+        db.add(entry)
+        # Don't commit here — caller controls the transaction
+    except Exception as e:
+        logger.warning(f"Failed to write activity log: {e}")
 
 
 def clean_price(value) -> Optional[float]:
@@ -443,6 +482,15 @@ async def upload_invoice_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
         db.add(invoice)
         db.commit()
         db.refresh(invoice)
+        
+        # Log the upload
+        log_activity(
+            db, actor="OCR", action=Actions.INVOICE_UPLOADED,
+            target_type="invoice", target_id=invoice.id,
+            detail=f"Uploaded {file.filename} — {invoice.vendor_name} #{invoice.invoice_number}"
+        )
+        db.commit()
+        
         logger.info(f"Invoice saved to database with ID: {invoice.id}")
     except Exception as db_error:
         db.rollback()
@@ -481,6 +529,12 @@ async def delete_invoice(invoice_id: int):
         vendor = invoice.vendor_name
         inv_num = invoice.invoice_number
         db.delete(invoice)
+        
+        log_activity(
+            db, actor="system", action=Actions.INVOICE_DELETED,
+            target_type="invoice", target_id=invoice_id,
+            detail=f"Deleted invoice #{inv_num} from {vendor}"
+        )
         db.commit()
         
         response = {
@@ -574,6 +628,7 @@ def format_invoice(invoice):
         "dept_status": invoice.dept_status,
         "dept_review_date": invoice.dept_review_date.isoformat() if invoice.dept_review_date else None,
         "dept_review_notes": invoice.dept_review_notes,
+        "precoding_notes": invoice.precoding_notes,
         
         # Price change info
         "price_changes_detected": invoice.price_changes_detected,
@@ -587,12 +642,17 @@ def format_invoice(invoice):
 
 @app.get("/api/invoices/precoding-queue")
 async def get_precoding_queue():
-    """Get all invoices waiting for pre-coding (stage 1)"""
+    """Get all invoices waiting for pre-coding.
+    Includes both newly captured invoices (stage 1) and
+    rejected invoices sent back for re-coding (stage 2)."""
     db = get_db_session()
     try:
         invoices = db.query(Invoice).filter(
-            Invoice.current_stage == 1,
-            Invoice.stage_status == "captured"
+            (
+                (Invoice.current_stage == 1) & (Invoice.stage_status == "captured")
+            ) | (
+                (Invoice.current_stage == 2) & (Invoice.stage_status == "precoding")
+            )
         ).order_by(Invoice.created_at.desc()).all()
         
         response = {
@@ -649,6 +709,12 @@ async def precode_invoice(invoice_id: int, body: PrecodeRequest):
         
         invoice.last_updated = datetime.utcnow()
         invoice.last_updated_by = body.precoder
+        
+        log_activity(
+            db, actor=body.precoder or "unknown", action=Actions.INVOICE_PRECODED,
+            target_type="invoice", target_id=invoice.id,
+            detail=f"Coded to {body.department} (GL: {body.gl_account}, CC: {body.cost_center}) — assigned to {invoice.dept_reviewer}"
+        )
         
         db.commit()
         db.refresh(invoice)
@@ -736,6 +802,12 @@ async def dept_approve_invoice(invoice_id: int, body: DeptApproveRequest):
             invoice.price_change_count = 0
             message = "Invoice approved. No price changes detected."
         
+        log_activity(
+            db, actor=body.reviewer, action=Actions.INVOICE_APPROVED,
+            target_type="invoice", target_id=invoice.id,
+            detail=f"Approved {invoice.vendor_name} #{invoice.invoice_number} (${invoice.total_amount:.2f}). {change_count} price change(s)."
+        )
+        
         db.commit()
         db.refresh(invoice)
         
@@ -777,6 +849,12 @@ async def dept_reject_invoice(invoice_id: int, body: DeptRejectRequest):
         invoice.stage_status = "precoding"
         invoice.last_updated = datetime.utcnow()
         invoice.last_updated_by = body.reviewer
+        
+        log_activity(
+            db, actor=body.reviewer, action=Actions.INVOICE_REJECTED,
+            target_type="invoice", target_id=invoice.id,
+            detail=f"Rejected {invoice.vendor_name} #{invoice.invoice_number} — reason: {body.notes}"
+        )
         
         db.commit()
         db.refresh(invoice)
@@ -866,6 +944,13 @@ async def review_price_change(change_id: int, body: PriceChangeReviewRequest):
         pc.reviewed_at = datetime.utcnow()
         pc.review_notes = body.review_notes
         
+        log_activity(
+            db, actor=body.reviewed_by,
+            action=Actions.PRICE_CHANGE_ACKNOWLEDGED if body.review_status == "acknowledged" else Actions.PRICE_CHANGE_ESCALATED,
+            target_type="price_change", target_id=pc.id,
+            detail=f"{body.review_status.title()} price change: {pc.vendor_name} / {pc.item_description} (${pc.previous_price:.2f} -> ${pc.new_price:.2f})"
+        )
+        
         # Check if all changes for this invoice are now reviewed
         remaining = db.query(PriceChange).filter(
             PriceChange.invoice_id == pc.invoice_id,
@@ -929,6 +1014,12 @@ async def review_price_changes_bulk(invoice_id: int, body: PriceChangeReviewRequ
             invoice.last_updated = datetime.utcnow()
             invoice.last_updated_by = body.reviewed_by
         
+        log_activity(
+            db, actor=body.reviewed_by, action=Actions.PRICE_CHANGES_BULK_REVIEWED,
+            target_type="invoice", target_id=invoice_id,
+            detail=f"Bulk {body.review_status} {len(changes)} price change(s) for invoice {invoice_id}"
+        )
+        
         db.commit()
         
         response = {
@@ -983,6 +1074,85 @@ async def get_price_change_history(vendor_name: Optional[str] = None, limit: int
             "success": True,
             "count": len(result),
             "changes": result
+        }
+    finally:
+        db.close()
+
+    return response
+
+
+# ========== DASHBOARD SUMMARY ENDPOINT ==========
+
+@app.get("/api/dashboard/summary")
+async def get_dashboard_summary(reviewer_name: Optional[str] = None):
+    """Returns counts for the dashboard: items to code, items to approve, pending price changes."""
+    db = get_db_session()
+    try:
+        # Invoices awaiting coding (stage 1 captured OR stage 2 precoding / rejected)
+        to_code = db.query(Invoice).filter(
+            (
+                (Invoice.current_stage == 1) & (Invoice.stage_status == "captured")
+            ) | (
+                (Invoice.current_stage == 2) & (Invoice.stage_status == "precoding")
+            )
+        ).count()
+
+        # Invoices awaiting this user's approval
+        to_approve = 0
+        if reviewer_name:
+            to_approve = db.query(Invoice).filter(
+                Invoice.current_stage == 3,
+                Invoice.stage_status == "dept_review",
+                Invoice.dept_reviewer == reviewer_name,
+                Invoice.dept_status == "pending"
+            ).count()
+
+        # Pending price changes
+        pending_price_changes = db.query(PriceChange).filter(
+            PriceChange.review_status == "pending"
+        ).count()
+
+        # Total invoices
+        total_invoices = db.query(Invoice).count()
+
+        response = {
+            "success": True,
+            "to_code": to_code,
+            "to_approve": to_approve,
+            "pending_price_changes": pending_price_changes,
+            "total_invoices": total_invoices,
+        }
+    finally:
+        db.close()
+
+    return response
+
+
+@app.get("/api/activity-log")
+async def get_activity_log(limit: int = 20):
+    """Returns recent activity log entries for the AP Processing app."""
+    db = get_db_session()
+    try:
+        entries = db.query(ActivityLog).filter(
+            ActivityLog.app_name == "ap_processing"
+        ).order_by(ActivityLog.created_at.desc()).limit(limit).all()
+
+        result = []
+        for e in entries:
+            result.append({
+                "id": e.id,
+                "created_at": e.created_at.isoformat() if e.created_at else None,
+                "actor": e.actor,
+                "action": e.action,
+                "target_type": e.target_type,
+                "target_id": e.target_id,
+                "detail": e.detail,
+            })
+
+        response = {
+            "success": True,
+            "count": len(result),
+            "entries": result,
         }
     finally:
         db.close()
@@ -1128,6 +1298,13 @@ async def import_csv(file: UploadFile = File(...)):
                 db.add(ph)
             
             created_count += 1
+        
+        # Log the import
+        log_activity(
+            db, actor="CSV Import", action=Actions.CSV_IMPORTED,
+            target_type="invoice", target_id=None,
+            detail=f"Imported {created_count} invoice(s), skipped {skipped_count} duplicate(s) from {file.filename}"
+        )
         
         db.commit()
         

@@ -133,3 +133,28 @@ class PriceChange(Base):
     reviewed_by = Column(String, nullable=True)
     reviewed_at = Column(DateTime, nullable=True)
     review_notes = Column(Text, nullable=True)
+
+
+class ActivityLog(Base):
+    """Audit trail for all meaningful state changes across Operon Core.
+    Shared table — used by both AP Processing and Crew & Property apps."""
+    __tablename__ = "activity_log"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Who performed the action
+    actor = Column(String, nullable=False)
+    
+    # What happened
+    action = Column(String, nullable=False, index=True)
+    
+    # Which record was affected
+    target_type = Column(String, nullable=True)   # "invoice", "price_change", etc.
+    target_id = Column(Integer, nullable=True)
+    
+    # Human-readable summary
+    detail = Column(Text, nullable=True)
+    
+    # Which app produced this entry
+    app_name = Column(String, default="ap_processing")
